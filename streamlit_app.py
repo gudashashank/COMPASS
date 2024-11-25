@@ -175,10 +175,32 @@ def login_page():
 @st.cache_data
 def load_data():
     """Load all necessary data files"""
-    living_expenses_df = pd.read_csv("/workspaces/COMPASS/data/Avg_Living_Expenses.csv")
-    employment_projections_df = pd.read_csv("/workspaces/COMPASS/data/Employment_Projections.csv")
-    university_text = docx2txt.process("/workspaces/COMPASS/data/University_Data.docx")
-    return living_expenses_df, employment_projections_df, university_text
+    try:
+        # Get the absolute path to the data directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        data_dir = os.path.join(current_dir, "data")
+        
+        # For local development
+        if not os.path.exists(data_dir):
+            # Try one level up (for different directory structures)
+            data_dir = os.path.join(current_dir, "..", "data")
+        
+        # Read the files
+        living_expenses_df = pd.read_csv(os.path.join(data_dir, "Avg_Living_Expenses.csv"))
+        employment_projections_df = pd.read_csv(os.path.join(data_dir, "Employment_Projections.csv"))
+        university_text = docx2txt.process(os.path.join(data_dir, "University_Data.docx"))
+        
+        return living_expenses_df, employment_projections_df, university_text
+        
+    except Exception as e:
+        st.error(f"Error loading data files: {str(e)}")
+        st.write("Please ensure the following files exist in the 'data' directory:")
+        st.write("- Avg_Living_Expenses.csv")
+        st.write("- Employment_Projections.csv")
+        st.write("- University_Data.docx")
+        
+        # Return empty dataframes and text to prevent crashes
+        return pd.DataFrame(), pd.DataFrame(), ""
 
 def get_living_expenses_info(query):
     """Function to query living expenses data"""
