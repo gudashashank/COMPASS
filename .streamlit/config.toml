@@ -1,0 +1,5 @@
+[server]
+enableXsrfProtection = false
+
+[runner]
+pythonPath = "/home/adminuser/.local/bin/python3"
