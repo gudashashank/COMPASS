@@ -149,44 +149,25 @@ def initialize_chromadb():
             model_name="text-embedding-ada-002"
         )
         
-        # Remove existing database if it exists to handle schema changes
-        import shutil
-        if os.path.exists("./chroma_db"):
-            shutil.rmtree("./chroma_db")
+        # Try to connect to existing ChromaDB instance with read-only access
+        chroma_client = chromadb.Client()
         
-        # Initialize ChromaDB client with settings
-        os.makedirs("./chroma_db", exist_ok=True)
-        settings = chromadb.Settings(
-            is_persistent=True,
-            persist_directory="./chroma_db",
-            anonymized_telemetry=False
-        )
-        
-        # Create new client instance
-        chroma_client = chromadb.Client(settings)
-        
-        # Create collections with new schema
-        university_collection = chroma_client.create_collection(
+        # Get existing collections
+        university_collection = chroma_client.get_collection(
             name="university_info",
-            embedding_function=embedding_function,
-            metadata={"hnsw:space": "cosine"}
+            embedding_function=embedding_function
         )
         
-        living_expenses_collection = chroma_client.create_collection(
+        living_expenses_collection = chroma_client.get_collection(
             name="living_expenses",
-            embedding_function=embedding_function,
-            metadata={"hnsw:space": "cosine"}
+            embedding_function=embedding_function
         )
         
-        employment_collection = chroma_client.create_collection(
+        employment_collection = chroma_client.get_collection(
             name="employment_projections",
-            embedding_function=embedding_function,
-            metadata={"hnsw:space": "cosine"}
+            embedding_function=embedding_function
         )
         
-        # Load initial data since we're starting fresh
-        load_initial_data()
-            
         return True
         
     except Exception as e:
