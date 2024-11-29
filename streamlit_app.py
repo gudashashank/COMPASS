@@ -149,8 +149,8 @@ def initialize_chromadb():
             model_name="text-embedding-ada-002"
         )
         
-        # Try to connect to existing ChromaDB instance with read-only access
-        chroma_client = chromadb.Client()
+        # Connect to existing ChromaDB instance using PersistentClient
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
         
         # Get existing collections
         university_collection = chroma_client.get_collection(
@@ -168,6 +168,7 @@ def initialize_chromadb():
             embedding_function=embedding_function
         )
         
+        logger.info("Successfully connected to existing ChromaDB")
         return True
         
     except Exception as e:
