@@ -175,13 +175,9 @@ def initialize_chromadb():
             
         return True
         
-    except TypeError as e:
+    except Exception as e:
         logger.error(f"Error initializing ChromaDB: {str(e)}")
         st.error(f"Failed to initialize database: {str(e)}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error initializing ChromaDB: {str(e)}")
-        st.error(f"Failed to initialize the system. Please refresh the page.")
         return False
 
 def load_initial_data():
