@@ -483,7 +483,7 @@ def show_login_page():
                 st.success(f"Welcome, {username}!")
                 if not st.session_state.user_data.get("preferences"):
                     st.info("Please set your preferences to continue.")
-                st.experimental_rerun()
+                st.rerun()
 
 def show_preferences_form(existing_preferences=None):
     """Display the preferences setup/edit form."""
@@ -569,7 +569,7 @@ def show_sidebar():
         if st.button("🚪 Logout", key="logout_sidebar"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
-            st.experimental_rerun()
+            st.rerun()
 
 def show_chat_interface():
     """Display the main chat interface."""
@@ -578,7 +578,7 @@ def show_chat_interface():
         st.header("✏️ Edit Preferences")
         if show_preferences_form(st.session_state.user_data.get("preferences")):
             st.session_state.show_preferences = False
-            st.experimental_rerun()
+            st.rerun()
         return
     
     st.header("💬 Chat with COMPASS")
@@ -599,7 +599,7 @@ def show_chat_interface():
         if st.button("🗑️ Clear Chat"):
             st.session_state.user_data["chat_history"] = []
             save_chat_history(st.session_state.current_user, [])
-            st.experimental_rerun()
+            st.rerun()
 
     # Display chat history
     for message in st.session_state.user_data["chat_history"]:
