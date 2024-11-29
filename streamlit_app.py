@@ -149,9 +149,13 @@ def initialize_chromadb():
             model_name="text-embedding-ada-002"
         )
         
-        # Initialize ChromaDB client
+        # Initialize ChromaDB client with settings
         os.makedirs("./chroma_db", exist_ok=True)
-        chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        settings = chromadb.Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory="./chroma_db"
+        )
+        chroma_client = chromadb.Client(settings)
         
         # Create collections
         university_collection = chroma_client.get_or_create_collection(
