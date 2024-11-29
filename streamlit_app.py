@@ -149,13 +149,9 @@ def initialize_chromadb():
             model_name="text-embedding-ada-002"
         )
         
-        # Initialize ChromaDB client with settings
+        # Initialize ChromaDB client
         os.makedirs("./chroma_db", exist_ok=True)
-        settings = chromadb.Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory="./chroma_db"
-        )
-        chroma_client = chromadb.Client(settings)
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
         
         # Create collections
         university_collection = chroma_client.get_or_create_collection(
@@ -179,9 +175,13 @@ def initialize_chromadb():
             
         return True
         
-    except Exception as e:
+    except TypeError as e:
         logger.error(f"Error initializing ChromaDB: {str(e)}")
         st.error(f"Failed to initialize database: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error initializing ChromaDB: {str(e)}")
+        st.error(f"Failed to initialize the system. Please refresh the page.")
         return False
 
 def load_initial_data():
