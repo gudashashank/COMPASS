@@ -149,29 +149,43 @@ def initialize_chromadb():
             model_name="text-embedding-ada-002"
         )
         
-        # Initialize ChromaDB client
+        # Remove existing database if it exists to handle schema changes
+        import shutil
+        if os.path.exists("./chroma_db"):
+            shutil.rmtree("./chroma_db")
+        
+        # Initialize ChromaDB client with settings
         os.makedirs("./chroma_db", exist_ok=True)
-        chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        settings = chromadb.Settings(
+            is_persistent=True,
+            persist_directory="./chroma_db",
+            anonymized_telemetry=False
+        )
         
-        # Create collections
-        university_collection = chroma_client.get_or_create_collection(
+        # Create new client instance
+        chroma_client = chromadb.Client(settings)
+        
+        # Create collections with new schema
+        university_collection = chroma_client.create_collection(
             name="university_info",
-            embedding_function=embedding_function
+            embedding_function=embedding_function,
+            metadata={"hnsw:space": "cosine"}
         )
         
-        living_expenses_collection = chroma_client.get_or_create_collection(
+        living_expenses_collection = chroma_client.create_collection(
             name="living_expenses",
-            embedding_function=embedding_function
+            embedding_function=embedding_function,
+            metadata={"hnsw:space": "cosine"}
         )
         
-        employment_collection = chroma_client.get_or_create_collection(
+        employment_collection = chroma_client.create_collection(
             name="employment_projections",
-            embedding_function=embedding_function
+            embedding_function=embedding_function,
+            metadata={"hnsw:space": "cosine"}
         )
         
-        # Load initial data if collections are empty
-        if university_collection.count() == 0:
-            load_initial_data()
+        # Load initial data since we're starting fresh
+        load_initial_data()
             
         return True
         
