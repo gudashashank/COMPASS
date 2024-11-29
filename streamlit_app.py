@@ -1,658 +1,679 @@
-import sys
-import sqlite3
-# SQLite version check
-try:
-    import pysqlite3
-    sys.modules['sqlite3'] = pysqlite3
-except ImportError:
-    print(f"Using default SQLite version: {sqlite3.sqlite_version}")
+# Importing necessary libraries for the system
 import os
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 import streamlit as st
-from langchain.vectorstores import Chroma
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chains import RetrievalQA, ConversationalRetrievalChain
-from langchain.chat_models import ChatOpenAI
-from langchain.agents import AgentType, initialize_agent
-from langchain.tools import Tool
-from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
 import pandas as pd
-import openai
+import docx
+from typing import Dict, List, Optional
 import chromadb
-from chromadb.config import Settings
-import uuid
+from chromadb.utils import embedding_functions
+from openai import OpenAI
 import requests
-import docx2txt
-from pathlib import Path
+import logging
 import json
 from datetime import datetime
 
-# Set page config
-st.set_page_config(page_title="University Assistant", layout="wide")
-st.title("International Student University Assistant")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Initialize session states
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'show_chat' not in st.session_state:
-    st.session_state.show_chat = False
-if 'preferences' not in st.session_state:
-    st.session_state.preferences = {}
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = None
-if 'initial_recommendations' not in st.session_state:
-    st.session_state.initial_recommendations = None
+# Global variables for database collections
+university_collection = None
+living_expenses_collection = None
+employment_collection = None
+chroma_client = None
+embedding_function = None
 
-# Constants
-US_REGIONS = {
-    "Northeast": ["Maine", "New Hampshire", "Vermont", "Massachusetts", "Rhode Island", "Connecticut", "New York", "Pennsylvania", "New Jersey"],
-    "Southeast": ["Maryland", "Delaware", "Virginia", "West Virginia", "Kentucky", "Tennessee", "North Carolina", "South Carolina", "Georgia", "Florida", "Alabama", "Mississippi", "Arkansas", "Louisiana"],
-    "Midwest": ["Ohio", "Indiana", "Illinois", "Michigan", "Wisconsin", "Minnesota", "Iowa", "Missouri", "North Dakota", "South Dakota", "Nebraska", "Kansas"],
-    "Southwest": ["Texas", "Oklahoma", "New Mexico", "Arizona"],
-    "West": ["Colorado", "Wyoming", "Montana", "Idaho", "Washington", "Oregon", "Utah", "Nevada", "California", "Alaska", "Hawaii"]
+# Location to city mapping for weather
+LOCATION_TO_CITY = {
+    "Northeast": "New York",
+    "Southeast": "Miami",
+    "Midwest": "Chicago",
+    "Southwest": "Houston",
+    "West Coast": "Los Angeles"
 }
 
-# Enhanced system prompt
-SYSTEM_PROMPT = """You are a highly knowledgeable university advisor for international students. Your role is to provide detailed, actionable advice that helps students make informed decisions about their education in the United States. 
+# User data file path
+USER_DATA_FILE = "user_data.json"
 
-When providing initial recommendations:
-1. Focus on the top 3 universities that best match the student's preferences
-2. For each university provide:
-   - Brief overview of the program strength
-   - Specific costs and potential scholarships
-   - Location benefits and climate match
-   - Notable features or advantages
-3. Keep the initial recommendations concise but informative
+# Chatbot usage tips
+CHATBOT_TIPS = """
+### 💡 Tips for Using COMPASS
 
-When answering follow-up questions:
-1. Provide detailed, specific information about asked universities
-2. Compare and contrast options when relevant
-3. Include practical next steps and actionable advice
-4. Focus on international student perspective
+1. **Ask Specific Questions**
+   - About university programs
+   - About living costs in different locations
+   - About job prospects in your field
+   - About weather conditions
 
-Remember to:
-- Consider the complete student context (field, budget, location preferences)
-- Be realistic about challenges and opportunities
-- Provide evidence-based recommendations
-- Maintain an encouraging and supportive tone"""
+2. **Get Recommendations**
+   - Click "Top 3 Recommendations" for personalized suggestions
+   - Ask follow-up questions about specific universities
+   - Inquire about admission requirements
 
-# Set API keys from Streamlit secrets
-OPENAI_API_KEY = st.secrets["open-key"]
-OPENWEATHER_API_KEY = st.secrets["open-weather"]
+3. **Explore Details**
+   - Ask about specific universities
+   - Request cost breakdowns
+   - Learn about campus life
+   - Get weather information
 
-# Initialize OpenAI
-openai.api_key = OPENAI_API_KEY
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini", openai_api_key=OPENAI_API_KEY)
+4. **Example Questions**
+   - "Tell me more about Georgia Tech's program"
+   - "What are the living costs in Atlanta?"
+   - "How's the job market for data science in the Northeast?"
+   - "Compare the weather between Boston and Miami"
+"""
 
-# User Authentication Functions
-def initialize_user_db():
-    """Initialize user database if it doesn't exist"""
-    if not os.path.exists('user_data'):
-        os.makedirs('user_data')
-    if not os.path.exists('user_data/users.json'):
-        with open('user_data/users.json', 'w') as f:
-            json.dump({}, f)
+def load_user_data() -> dict:
+    """Load user data from JSON file."""
+    if os.path.exists(USER_DATA_FILE):
+        try:
+            with open(USER_DATA_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading user data: {str(e)}")
+    return {}
 
-def load_user_data(user_id):
-    """Load user data from JSON file"""
+def save_user_data(data: dict):
+    """Save user data to JSON file."""
     try:
-        with open('user_data/users.json', 'r') as f:
-            users = json.load(f)
-        return users.get(user_id, None)
-    except FileNotFoundError:
-        initialize_user_db()
-        return None
+        with open(USER_DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving user data: {str(e)}")
 
-def save_user_data(user_id, data):
-    """Save user data to JSON file"""
-    try:
-        with open('user_data/users.json', 'r') as f:
-            users = json.load(f)
-    except FileNotFoundError:
-        users = {}
+def authenticate_user(username: str) -> bool:
+    """Authenticate user and load their data."""
+    users = load_user_data()
     
-    users[user_id] = data
-    
-    with open('user_data/users.json', 'w') as f:
-        json.dump(users, f, indent=4)
-
-def save_current_session():
-    """Save current session data for the user"""
-    if hasattr(st.session_state, 'user_id') and st.session_state.user_id:
-        user_data = {
-            'preferences': st.session_state.preferences,
-            'chat_history': st.session_state.chat_history[-10:],  # Save last 10 conversations
-            'initial_recommendations': st.session_state.initial_recommendations,
-            'last_login': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Initialize session state for new user
+    if username not in users:
+        users[username] = {
+            "preferences": None,
+            "chat_history": [],
+            "last_recommendations": None,
+            "created_at": datetime.now().isoformat()
         }
-        save_user_data(st.session_state.user_id, user_data)
+        save_user_data(users)
+    
+    # Load user data into session state
+    st.session_state.current_user = username
+    st.session_state.user_data = users[username]
+    st.session_state.authenticated = True
+    
+    return True
 
-def login_page():
-    """Display login page and handle user authentication"""
-    st.write("### Welcome to University Assistant")
-    st.write("Please enter your username to continue")
-    
-    user_id = st.text_input("Username:", key="user_id_input",
-                           help="Enter your username to access your saved preferences")
-    
-    if user_id:
-        user_data = load_user_data(user_id)
-        
-        if user_data:
-            st.success(f"Welcome back, {user_id}! 👋")
-            # Load user preferences and chat history
-            st.session_state.preferences = user_data.get('preferences', {})
-            st.session_state.chat_history = user_data.get('chat_history', [])
-            st.session_state.initial_recommendations = user_data.get('initial_recommendations', None)
-            st.session_state.user_id = user_id
-            st.session_state.authenticated = True
-            
-            # Display last login time
-            last_login = user_data.get('last_login', 'First time login')
-            st.info(f"Last login: {last_login}")
-            
-            # Update last login time
-            user_data['last_login'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_user_data(user_id, user_data)
-            
-            if st.button("Continue to Assistant"):
-                st.experimental_rerun()
-        else:
-            st.info("New user detected! Let's set up your preferences.")
-            st.session_state.user_id = user_id
-            st.session_state.authenticated = True
-            st.session_state.show_chat = False
-            
-            if st.button("Set Up Preferences"):
-                st.experimental_rerun()
-    
-    return st.session_state.get('authenticated', False)
+def save_user_preferences(username: str, preferences: dict):
+    """Save user preferences."""
+    users = load_user_data()
+    if username in users:
+        users[username]["preferences"] = preferences
+        save_user_data(users)
+        st.session_state.user_data = users[username]
 
-# Data Loading Functions
-@st.cache_data
-def load_data():
-    """Load all necessary data files"""
+def save_chat_history(username: str, chat_history: list):
+    """Save chat history for a user."""
+    users = load_user_data()
+    if username in users:
+        users[username]["chat_history"] = chat_history
+        save_user_data(users)
+
+def save_last_recommendations(username: str, recommendations: str):
+    """Save last recommendations for context."""
+    users = load_user_data()
+    if username in users:
+        users[username]["last_recommendations"] = recommendations
+        save_user_data(users)
+        st.session_state.user_data = users[username]
+
+def load_word_document(file_path: str) -> str:
+    """Load content from a Word document."""
     try:
-        # Get the absolute path to the data directory
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        data_dir = os.path.join(current_dir, "data")
+        doc = docx.Document(file_path)
+        return "\n".join([paragraph.text for paragraph in doc.paragraphs])
+    except Exception as e:
+        st.error(f"Error loading Word document: {str(e)}")
+        return ""
+
+def initialize_chromadb():
+    """Initialize ChromaDB with OpenAI embeddings."""
+    global university_collection, living_expenses_collection, employment_collection
+    global chroma_client, embedding_function
+    
+    try:
+        # Setup OpenAI embedding function
+        embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+            api_key=st.secrets["open-key"],
+            model_name="text-embedding-ada-002"
+        )
         
-        # For local development
-        if not os.path.exists(data_dir):
-            # Try one level up (for different directory structures)
-            data_dir = os.path.join(current_dir, "..", "data")
+        # Initialize ChromaDB client
+        os.makedirs("./chroma_db", exist_ok=True)
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
         
-        # Read the files
-        living_expenses_df = pd.read_csv(os.path.join(data_dir, "Avg_Living_Expenses.csv"))
-        employment_projections_df = pd.read_csv(os.path.join(data_dir, "Employment_Projections.csv"))
-        university_text = docx2txt.process(os.path.join(data_dir, "University_Data.docx"))
+        # Create collections
+        university_collection = chroma_client.get_or_create_collection(
+            name="university_info",
+            embedding_function=embedding_function
+        )
         
-        return living_expenses_df, employment_projections_df, university_text
+        living_expenses_collection = chroma_client.get_or_create_collection(
+            name="living_expenses",
+            embedding_function=embedding_function
+        )
+        
+        employment_collection = chroma_client.get_or_create_collection(
+            name="employment_projections",
+            embedding_function=embedding_function
+        )
+        
+        # Load initial data if collections are empty
+        if university_collection.count() == 0:
+            load_initial_data()
+            
+        return True
         
     except Exception as e:
-        st.error(f"Error loading data files: {str(e)}")
-        st.write("Please ensure the following files exist in the 'data' directory:")
-        st.write("- Avg_Living_Expenses.csv")
-        st.write("- Employment_Projections.csv")
-        st.write("- University_Data.docx")
+        logger.error(f"Error initializing ChromaDB: {str(e)}")
+        st.error(f"Failed to initialize database: {str(e)}")
+        return False
+
+def load_initial_data():
+    """Load initial data into ChromaDB collections."""
+    try:
+        # Load datasets
+        living_expenses_df = pd.read_csv(os.path.join("data", "Avg_Living_Expenses.csv"))
+        employment_df = pd.read_csv(os.path.join("data", "Employment_Projections.csv"))
+        university_text = load_word_document(os.path.join("data", "University_Data.docx"))
         
-        # Return empty dataframes and text to prevent crashes
-        return pd.DataFrame(), pd.DataFrame(), ""
-
-def get_living_expenses_info(query):
-    """Function to query living expenses data"""
-    try:
-        df = load_data()[0]  # Get living expenses DataFrame
-        return str(df.query(query) if 'query' in query.lower() else df[df['State'].str.contains(query, case=False)])
+        # Process living expenses
+        logger.info("Processing living expenses data...")
+        for idx, row in living_expenses_df.iterrows():
+            content = (
+                f"State: {row['State']}\n"
+                f"Cost of Living Index: {row['Index']}\n"
+                f"Grocery: {row['Grocery']}\n"
+                f"Housing: {row['Housing']}\n"
+                f"Utilities: {row['Utilities']}\n"
+                f"Transportation: {row['Transportation']}\n"
+                f"Health: {row['Health']}\n"
+                f"Miscellaneous: {row['Misc.']}"
+            )
+            living_expenses_collection.add(
+                documents=[content],
+                metadatas=[{
+                    "state": row["State"].strip(),
+                    "type": "living_expenses",
+                    "index": float(row["Index"])
+                }],
+                ids=[f"living_expenses_{idx}"]
+            )
+        
+        # Process employment projections
+        logger.info("Processing employment projections data...")
+        for idx, row in employment_df.iterrows():
+            content = (
+                f"Occupation: {row['Occupation Title']}\n"
+                f"Employment 2023: {row['Employment 2023']}\n"
+                f"Growth Rate: {row['Employment Percent Change, 2023-2033']}%\n"
+                f"Annual Openings: {row['Occupational Openings, 2023-2033 Annual Average']}\n"
+                f"Median Wage: ${row['Median Annual Wage 2023']}\n"
+                f"Required Education: {row['Typical Entry-Level Education']}"
+            )
+            employment_collection.add(
+                documents=[content],
+                metadatas=[{
+                    "occupation": row["Occupation Title"],
+                    "type": "employment",
+                    "median_wage": float(row["Median Annual Wage 2023"])
+                }],
+                ids=[f"employment_{idx}"]
+            )
+        
+        # Process university data
+        logger.info("Processing university data...")
+        chunk_size = 1000
+        chunks = [university_text[i:i + chunk_size] for i in range(0, len(university_text), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks):
+            # Add some basic text preprocessing
+            chunk = chunk.strip()
+            if not chunk:  # Skip empty chunks
+                continue
+                
+            university_collection.add(
+                documents=[chunk],
+                metadatas=[{
+                    "chunk_id": idx,
+                    "type": "university",
+                    "length": len(chunk)
+                }],
+                ids=[f"university_{idx}"]
+            )
+        
+        logger.info("Successfully loaded initial data into ChromaDB")
+        
     except Exception as e:
-        return f"Error querying living expenses: {str(e)}"
+        logger.error(f"Error loading initial data: {str(e)}")
+        raise e
 
-def get_employment_info(query):
-    """Function to query employment projections data"""
+def reset_chromadb():
+    """Reset ChromaDB collections (useful for testing)."""
+    global chroma_client
     try:
-        df = load_data()[1]  # Get employment DataFrame
-        return str(df[df['Occupation Title'].str.contains(query, case=False, na=False)])
+        if chroma_client:
+            for collection_name in ["university_info", "living_expenses", "employment_projections"]:
+                try:
+                    chroma_client.delete_collection(collection_name)
+                    logger.info(f"Deleted collection: {collection_name}")
+                except:
+                    pass
+        return initialize_chromadb()
     except Exception as e:
-        return f"Error querying employment data: {str(e)}"
-
-def get_state_weather(location):
-    """Fetch weather data for a location"""
+        logger.error(f"Error resetting ChromaDB: {str(e)}")
+        return False
+    
+def get_living_expenses(state: str) -> str:
+    """Query living expenses information."""
     try:
-        url = f"http://api.openweathermap.org/data/2.5/weather"
+        results = living_expenses_collection.query(
+            query_texts=[state],
+            n_results=1
+        )
+        return results["documents"][0][0] if results["documents"][0] else "No information found."
+    except Exception as e:
+        logger.error(f"Error in get_living_expenses: {str(e)}")
+        return f"Error retrieving living expenses: {str(e)}"
+
+def get_job_market_trends(field: str) -> str:
+    """Query job market trends."""
+    try:
+        results = employment_collection.query(
+            query_texts=[field],
+            n_results=3
+        )
+        return "\n\n".join(results["documents"][0])
+    except Exception as e:
+        logger.error(f"Error in get_job_market_trends: {str(e)}")
+        return f"Error retrieving job market trends: {str(e)}"
+
+def get_university_info(query: str) -> str:
+    """Query university information."""
+    try:
+        results = university_collection.query(
+            query_texts=[query],
+            n_results=3
+        )
+        return "\n\n".join(results["documents"][0])
+    except Exception as e:
+        logger.error(f"Error in get_university_info: {str(e)}")
+        return f"Error retrieving university information: {str(e)}"
+
+def get_weather_info(location: str) -> str:
+    """Get weather information for a location's major city."""
+    try:
+        city = LOCATION_TO_CITY.get(location, location)
+        base_url = "http://api.openweathermap.org/data/2.5/weather"
         params = {
-            "q": f"{location},US",
-            "appid": OPENWEATHER_API_KEY,
+            "q": f"{city},US",
+            "appid": st.secrets["open-weather"],
             "units": "imperial"
         }
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            return {
-                "location": location,
-                "temperature": data["main"]["temp"],
-                "description": data["weather"][0]["description"],
-                "humidity": data["main"]["humidity"]
-            }
-        return f"Error getting weather for {location}"
+        
+        response = requests.get(base_url, params=params)
+        response.raise_for_status()
+        
+        data = response.json()
+        return (f"Current weather in {city}: "
+               f"Temperature: {data['main']['temp']}°F, "
+               f"Feels like: {data['main']['feels_like']}°F, "
+               f"Humidity: {data['main']['humidity']}%, "
+               f"Conditions: {data['weather'][0]['description']}")
     except Exception as e:
-        return f"Error: {str(e)}"
+        logger.error(f"Error in get_weather_info: {str(e)}")
+        return f"Error retrieving weather information: {str(e)}"
 
-def get_initial_recommendations(preferences, retrieval_chain):
-    """Generate initial university recommendations based on preferences"""
-    recommendation_prompt = f"""
-    Based on the student's preferences, provide the top 3 recommended universities:
-
-    STUDENT PROFILE:
-    - Field of Study: {preferences['field_of_study']}
-    - Yearly Budget: ${preferences['tuition_range'][0]:,} - ${preferences['tuition_range'][1]:,}
-    - Preferred Regions: {', '.join(preferences['preferred_regions'])}
-    - Weather Preference: {', '.join(preferences['preferred_weather'])}
-    
-    Additional Notes: {preferences.get('additional_notes', 'None provided')}
-
-    Please provide:
-    1. Top 3 universities that best match these preferences
-    2. For each university include:
-       - Program strengths and unique features
-       - Estimated costs (tuition, living expenses)
-       - Location benefits and climate
-       - Notable scholarships or funding opportunities
-    3. Brief explanation of why each university is recommended
-
-    Format the response in a clear, easy-to-read manner with university names in bold.
-    Keep the response focused and concise while maintaining important details.
-    """
-    
+def get_top_recommendations() -> str:
+    """Generate top 3 university recommendations based on user preferences."""
     try:
-        response = retrieval_chain({"question": recommendation_prompt})
-        return response['answer']
+        preferences = st.session_state.user_data["preferences"]
+        if not preferences:
+            return "Please set your preferences first to get personalized recommendations."
+
+        prompt = f"""Generate top 3 university recommendations based on these preferences:
+        - Field of Study: {preferences['field_of_study']}
+        - Budget Range: ${preferences['budget_min']}-${preferences['budget_max']}
+        - Preferred Locations: {', '.join(preferences['preferred_locations'])}
+        - Weather Preference: {preferences['weather_preference']}
+
+        Format each recommendation as:
+        [Number]. [University Name]
+        * Key strengths in {preferences['field_of_study']}
+        * Cost and aid highlights
+        * Location and weather notes
+        * Brief distinguishing features
+
+        Keep each university description detailed but concise. Include specific programs, costs, and unique features."""
+
+        client = OpenAI(api_key=st.secrets["open-key"])
+        response = client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a university advisor providing detailed, specific recommendations."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+            temperature=0.7
+        )
+        
+        recommendations = response.choices[0].message.content
+        save_last_recommendations(st.session_state.current_user, recommendations)
+        return recommendations
+
     except Exception as e:
-        return f"Error generating recommendations: {str(e)}"
+        logger.error(f"Error generating top recommendations: {str(e)}")
+        return "Error generating recommendations. Please try again."
 
-@st.cache_resource
-def initialize_chromadb(living_expenses_df, employment_projections_df, university_text):
-    """Initialize or load ChromaDB"""
-    persist_directory = "./chroma_db"
-    
-    # If ChromaDB already exists, load it
-    if os.path.exists(persist_directory):
-        try:
-            return Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-        except Exception as e:
-            st.warning(f"Error loading existing ChromaDB: {e}. Creating new database.")
-            import shutil
-            shutil.rmtree(persist_directory, ignore_errors=True)
-    
-    # Create new ChromaDB
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=persist_directory
-    ))
-    
-    # Create collection
-    collection = client.create_collection(name="university_assistant")
-    
-    # Process and add living expenses data
-    for _, row in living_expenses_df.iterrows():
-        doc = (f"State: {row['State']}, Living Expenses - Index: {row['Index']}, "
-               f"Grocery: {row['Grocery']}, Housing: {row['Housing']}, "
-               f"Utilities: {row['Utilities']}, Transportation: {row['Transportation']}, "
-               f"Health: {row['Health']}, Miscellaneous: {row.get('Misc.', 'N/A')}")
+def get_recommendations(query: str) -> str:
+    """Generate recommendations based on user query and preferences."""
+    try:
+        # Check if query is about a previously recommended university
+        last_recommendations = st.session_state.user_data.get("last_recommendations", "")
+        context = []
         
-        embedding = embeddings.embed_query(doc)
+        if last_recommendations and any(university.lower() in query.lower() 
+                                      for university in ["georgia tech", "unc", "vanderbilt", "chapel hill"]):
+            context.append(("Previous Recommendations:", last_recommendations))
         
-        collection.add(
-            embeddings=[embedding],
-            documents=[doc],
-            metadatas=[{"type": "living_expenses", "state": row["State"]}],
-            ids=[f"expenses_{uuid.uuid4()}"]
-        )
-    
-    # Process and add employment projections data
-    for _, row in employment_projections_df.iterrows():
-        doc = (f"Occupation: {row['Occupation Title']}, "
-               f"Employment Change (2023-2033): {row['Employment Change, 2023-2033']}, "
-               f"Median Annual Wage: ${row['Median Annual Wage 2023']}, "
-               f"Required Education: {row['Typical Entry-Level Education']}")
+        # Get university information
+        uni_info = get_university_info(query)
+        if uni_info:
+            context.append(("University Information:", uni_info))
         
-        embedding = embeddings.embed_query(doc)
+        # Get living expenses if state is mentioned
+        if any(word in query.lower() for word in ["state", "cost", "living", "expensive"]):
+            expenses_info = get_living_expenses(query)
+            if expenses_info:
+                context.append(("Living Expenses:", expenses_info))
         
-        collection.add(
-            embeddings=[embedding],
-            documents=[doc],
-            metadatas=[{"type": "employment", "occupation": row['Occupation Title']}],
-            ids=[f"employment_{uuid.uuid4()}"]
-        )
-    
-    # Process and add university data
-    chunks = university_text.split('\n\n')
-    for i, chunk in enumerate(chunks):
-        if chunk.strip():
-            embedding = embeddings.embed_query(chunk)
-            
-            collection.add(
-                embeddings=[embedding],
-                documents=[chunk],
-                metadatas=[{"type": "university", "index": i}],
-                ids=[f"university_{uuid.uuid4()}"]
-            )
-    
-    return Chroma(
-        client=client,
-        collection_name="university_assistant",
-        embedding_function=embeddings
-    )
+        # Get job market trends if career/job is mentioned
+        if any(word in query.lower() for word in ["job", "career", "employment", "salary", "work"]):
+            job_info = get_job_market_trends(st.session_state.user_data["preferences"]["field_of_study"])
+            if job_info:
+                context.append(("Job Market Trends:", job_info))
+        
+        # Get weather for relevant locations
+        if st.session_state.user_data["preferences"]["preferred_locations"]:
+            location_weather = []
+            for location in st.session_state.user_data["preferences"]["preferred_locations"]:
+                weather_info = get_weather_info(location)
+                if not weather_info.startswith("Error"):
+                    location_weather.append(weather_info)
+            if location_weather:
+                context.append(("Weather Information:", "\n".join(location_weather)))
+        
+        # Prepare prompt with context and user preferences
+        context_text = "\n\n".join([f"{title}\n{info}" for title, info in context])
+        preferences = st.session_state.user_data["preferences"]
+        
+        prompt = f"""As a university advisor, help with this query: {query}
 
-def create_tools():
-    """Create tools for the agent"""
-    return [
-        Tool(
-            name="Weather Info",
-            func=get_state_weather,
-            description="Get weather information for a US state or city"
-        ),
-        Tool(
-            name="Living Expenses",
-            func=get_living_expenses_info,
-            description="Get information about living expenses in different US states"
-        ),
-        Tool(
-            name="Employment Info",
-            func=get_employment_info,
-            description="Get employment projections and job market trends"
+Context:
+{context_text}
+
+Student Profile:
+- Field: {preferences['field_of_study']}
+- Budget: ${preferences['budget_min']}-${preferences['budget_max']}
+- Locations: {', '.join(preferences['preferred_locations'])}
+- Weather: {preferences['weather_preference']}
+
+Previous conversation context (if relevant):
+{last_recommendations}
+
+Provide a detailed, specific response focusing on the query. If the query is about a specific university from the previous recommendations, reference that information."""
+
+        # Generate response using OpenAI
+        client = OpenAI(api_key=st.secrets["open-key"])
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": ("You are a helpful university advisor for international students. "
+                              "When asked about specific universities from previous recommendations, "
+                              "maintain consistency with that information while adding more details. "
+                              "Provide specific, actionable insights.")
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.7
         )
-    ]
-def display_preferences_form():
-    """Display and handle the preferences form"""
-    st.write("### Your Preferences")
-    st.write(f"Setting up preferences for: **{st.session_state.user_id}**")
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        logger.error(f"Error in get_recommendations: {str(e)}")
+        return "I apologize, but I encountered an error. Please try asking a more specific question."
+
+def initialize_session_state():
+    """Initialize all session state variables."""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'current_user' not in st.session_state:
+        st.session_state.current_user = None
+    if 'user_data' not in st.session_state:
+        st.session_state.user_data = None
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = False
+    if 'show_preferences' not in st.session_state:
+        st.session_state.show_preferences = False
+
+def show_login_page():
+    """Display the login page."""
+    st.header("👋 Welcome to COMPASS")
     
-    with st.form("student_preferences"):
-        col1, col2 = st.columns(2)
+    with st.form("login_form"):
+        username = st.text_input("Enter your name")
+        submitted = st.form_submit_button("Login")
         
-        with col1:
-            field_of_study = st.text_input(
-                "What is your field of study?",
-                value=st.session_state.preferences.get('field_of_study', ''),
-                help="Enter your specific field of study or research interest"
-            )
-            
-            tuition_range = st.slider(
-                "What is your yearly tuition budget (USD)?",
-                10000, 70000, 
-                value=st.session_state.preferences.get('tuition_range', (20000, 40000)),
-                step=5000,
-                help="Select your minimum and maximum yearly tuition budget"
-            )
-            
-        with col2:
-            preferred_regions = st.multiselect(
-                "Which US regions are you interested in?",
-                options=list(US_REGIONS.keys()),
-                default=st.session_state.preferences.get('preferred_regions', []),
-                help="Select one or more regions you're interested in"
-            )
-            
-            preferred_weather = st.multiselect(
-                "What type of weather do you prefer?",
-                ["Warm", "Cold", "Moderate", "Sunny", "Rainy"],
-                default=st.session_state.preferences.get('preferred_weather', []),
-                help="Select your preferred weather conditions"
-            )
+        if submitted and username:
+            if authenticate_user(username):
+                st.success(f"Welcome, {username}!")
+                if not st.session_state.user_data.get("preferences"):
+                    st.info("Please set your preferences to continue.")
+                st.experimental_rerun()
 
-        additional_notes = st.text_area(
-            "Any additional preferences or requirements?",
-            value=st.session_state.preferences.get('additional_notes', ''),
-            help="Enter any other factors that are important to you (e.g., campus size, research opportunities, etc.)"
+def show_preferences_form(existing_preferences=None):
+    """Display the preferences setup/edit form."""
+    with st.form("preferences_form"):
+        # Field of Study (text input)
+        field_of_study = st.text_input(
+            "Field of Study",
+            value=existing_preferences.get("field_of_study", "") if existing_preferences else "",
+            help="Enter your intended field of study"
         )
-
-        submit_button = st.form_submit_button("Save Preferences & Get Recommendations")
         
-        if submit_button and field_of_study and preferred_regions and preferred_weather:
-            st.session_state.preferences = {
+        # Budget Range
+        default_min = existing_preferences.get("budget_min", 20000) if existing_preferences else 20000
+        default_max = existing_preferences.get("budget_max", 50000) if existing_preferences else 50000
+        budget_range = st.slider(
+            "Budget Range (USD/Year)",
+            0, 100000, (default_min, default_max),
+            help="Select your annual budget range"
+        )
+        
+        # Preferred Locations
+        default_locations = existing_preferences.get("preferred_locations", []) if existing_preferences else []
+        preferred_locations = st.multiselect(
+            "Preferred Locations",
+            ["Northeast", "Southeast", "Midwest", "Southwest", "West Coast"],
+            default=default_locations,
+            help="Select your preferred locations"
+        )
+        
+        # Weather Preference
+        default_weather = existing_preferences.get("weather_preference", "Moderate") if existing_preferences else "Moderate"
+        weather_preference = st.select_slider(
+            "Weather Preference",
+            options=["Cold", "Moderate", "Warm", "Hot"],
+            value=default_weather,
+            help="Select your preferred weather type"
+        )
+        
+        submitted = st.form_submit_button("Save Preferences")
+        
+        if submitted:
+            if not field_of_study or not preferred_locations:
+                st.error("Please fill in all required fields.")
+                return False
+            
+            preferences = {
                 "field_of_study": field_of_study,
-                "tuition_range": tuition_range,
-                "preferred_regions": preferred_regions,
-                "preferred_weather": preferred_weather,
-                "additional_notes": additional_notes
+                "budget_min": budget_range[0],
+                "budget_max": budget_range[1],
+                "preferred_locations": preferred_locations,
+                "weather_preference": weather_preference
             }
             
-            # Generate initial recommendations
-            with st.spinner('Generating your personalized university recommendations...'):
-                # Initialize components for recommendations
-                living_expenses_df, employment_projections_df, university_text = load_data()
-                vector_store = initialize_chromadb(
-                    living_expenses_df,
-                    employment_projections_df,
-                    university_text
-                )
-                
-                retrieval_chain = ConversationalRetrievalChain.from_llm(
-                    llm=llm,
-                    retriever=vector_store.as_retriever(),
-                    memory=ConversationBufferMemory(memory_key="chat_history", return_messages=True),
-                    verbose=True
-                )
-                
-                # Get recommendations
-                recommendations = get_initial_recommendations(st.session_state.preferences, retrieval_chain)
-                st.session_state.initial_recommendations = recommendations
-            
-            st.session_state.show_chat = True
-            save_current_session()
+            save_user_preferences(st.session_state.current_user, preferences)
+            st.success("✅ Preferences saved successfully!")
             return True
-            
-        elif submit_button:
-            st.error("Please fill in all required fields (Field of Study, Regions, and Weather preferences)")
     return False
 
-def display_chat_interface(agent, retrieval_chain):
-    """Display the chat interface"""
-    st.write("### Your University Assistant")
-    
-    # Display initial recommendations
-    if st.session_state.initial_recommendations:
-        with st.expander("📚 Your Personalized University Recommendations", expanded=True):
-            st.write(st.session_state.initial_recommendations)
-            st.write("---")
-            st.info("💡 Feel free to ask specific questions about these universities or explore other options!")
-    
-    # User profile and history
-    with st.expander("👤 Your Profile and Past Conversations", expanded=False):
-        st.write("#### Current Preferences")
-        st.write(f"**Username:** {st.session_state.user_id}")
-        st.write(f"**Field of Study:** {st.session_state.preferences['field_of_study']}")
-        st.write(f"**Yearly Tuition Budget:** ${st.session_state.preferences['tuition_range'][0]:,} - ${st.session_state.preferences['tuition_range'][1]:,}")
-        st.write(f"**Preferred Regions:** {', '.join(st.session_state.preferences['preferred_regions'])}")
-        st.write(f"**Preferred Weather:** {', '.join(st.session_state.preferences['preferred_weather'])}")
+def show_sidebar():
+    """Display sidebar with tips and preferences."""
+    with st.sidebar:
+        st.title("🎓 COMPASS Guide")
         
-        if st.session_state.preferences.get('additional_notes'):
-            st.write(f"**Additional Notes:** {st.session_state.preferences['additional_notes']}")
+        # Show current user
+        st.write(f"👤 Logged in as: {st.session_state.current_user}")
         
-        st.write("#### Recent Questions")
-        if st.session_state.chat_history:
-            for i, (role, message) in enumerate(st.session_state.chat_history[-5:]):
-                if role == "You":
-                    st.write(f"🗣️ **You asked:** {message[:100]}...")
-    
-    # Chat interface
-    st.write("### Ask Your Questions")
-    user_input = st.text_input(
-        "Your question:",
-        key="user_input",
-        help="Ask about specific universities, programs, costs, campus life, etc.",
-        placeholder="e.g., What are the admission requirements for the recommended universities?"
-    )
-    
-    if user_input:
-        # Create enhanced context including initial recommendations
-        all_states = [state for region in st.session_state.preferences['preferred_regions'] 
-                     for state in US_REGIONS[region]]
+        # Current Preferences Section
+        st.header("📋 Your Preferences")
+        prefs = st.session_state.user_data.get("preferences", {})
+        if prefs:
+            st.write(f"**Field of Study:** {prefs.get('field_of_study')}")
+            st.write(f"**Budget:** ${prefs.get('budget_min'):,} - ${prefs.get('budget_max'):,}")
+            st.write(f"**Locations:** {', '.join(prefs.get('preferred_locations', []))}")
+            st.write(f"**Weather:** {prefs.get('weather_preference')}")
+            
+            if st.button("✏️ Edit Preferences"):
+                st.session_state.show_preferences = True
         
-        context = f"""
-        STUDENT CONTEXT:
-        Field of Study: {st.session_state.preferences['field_of_study']}
-        Budget: ${st.session_state.preferences['tuition_range'][0]:,} - ${st.session_state.preferences['tuition_range'][1]:,}
-        Preferred Regions: {', '.join(st.session_state.preferences['preferred_regions'])}
-        States Available: {', '.join(all_states)}
-        Weather Preference: {', '.join(st.session_state.preferences['preferred_weather'])}
+        # Tips Section
+        st.markdown(CHATBOT_TIPS)
         
-        PREVIOUSLY RECOMMENDED UNIVERSITIES:
-        {st.session_state.initial_recommendations}
-        
-        CURRENT QUESTION: {user_input}
-        
-        Previous conversation context:
-        {' '.join([f"{role}: {msg}" for role, msg in st.session_state.chat_history[-3:]])}
-        
-        Please provide:
-        1. Specific answer to the question
-        2. Relevant details about any universities mentioned
-        3. Additional recommendations if applicable
-        4. Practical next steps
-        """
-        
-        try:
-            with st.spinner('Researching your question...'):
-                agent_response = agent.run(context)
-                
-                # Format and enhance the response
-                formatted_response = agent_response
-                
-                st.session_state.chat_history.append(("You", user_input))
-                st.session_state.chat_history.append(("Assistant", formatted_response))
-                save_current_session()
-                
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-
-    # Display chat history with improved formatting
-    st.write("### Conversation History")
-    for role, message in st.session_state.chat_history:
-        if role == "You":
-            st.markdown(f"""
-            <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
-                👤 <b>You:</b> {message}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div style='background-color: #e8f4f9; padding: 10px; border-radius: 5px; margin: 5px 0;'>
-                🤖 <b>Assistant:</b> {message}
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Control buttons
-    col1, col2, col3 = st.columns([1, 1, 4])
-    with col1:
-        if st.button("Clear Chat"):
-            st.session_state.chat_history = []
-            save_current_session()
-            st.experimental_rerun()
-    with col2:
-        if st.button("Update Preferences"):
-            st.session_state.show_chat = False
-            st.experimental_rerun()
-    with col3:
-        if st.button("Logout"):
-            save_current_session()
+        # Logout button at the bottom
+        if st.button("🚪 Logout", key="logout_sidebar"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.experimental_rerun()
 
+def show_chat_interface():
+    """Display the main chat interface."""
+    # Show preferences edit form if requested
+    if st.session_state.show_preferences:
+        st.header("✏️ Edit Preferences")
+        if show_preferences_form(st.session_state.user_data.get("preferences")):
+            st.session_state.show_preferences = False
+            st.experimental_rerun()
+        return
+    
+    st.header("💬 Chat with COMPASS")
+    
+    # Top recommendations and clear chat buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🌟 Top 3 Recommendations"):
+            recommendations = get_top_recommendations()
+            st.session_state.user_data["chat_history"].append({
+                "role": "assistant",
+                "content": recommendations
+            })
+            save_chat_history(st.session_state.current_user, 
+                            st.session_state.user_data["chat_history"])
+    
+    with col2:
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.user_data["chat_history"] = []
+            save_chat_history(st.session_state.current_user, [])
+            st.experimental_rerun()
+
+    # Display chat history
+    for message in st.session_state.user_data["chat_history"]:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask me about universities, programs, costs, or job prospects..."):
+        # Display user message
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Add to chat history
+        st.session_state.user_data["chat_history"].append({
+            "role": "user",
+            "content": prompt
+        })
+        
+        # Get and display assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response = get_recommendations(prompt)
+                st.write(response)
+                
+                # Add to chat history
+                st.session_state.user_data["chat_history"].append({
+                    "role": "assistant",
+                    "content": response
+                })
+        
+        # Save updated chat history
+        save_chat_history(
+            st.session_state.current_user,
+            st.session_state.user_data["chat_history"]
+        )
+
 def main():
-    """Main application function"""
-    try:
-        # Initialize user database
-        initialize_user_db()
-        
-        # Handle authentication
-        if not st.session_state.authenticated:
-            if login_page():
-                st.experimental_rerun()
-            return
-        
-        # Load data and initialize components
-        with st.spinner('Loading data and initializing components...'):
-            # Load data
-            living_expenses_df, employment_projections_df, university_text = load_data()
-            
-            # Initialize ChromaDB
-            vector_store = initialize_chromadb(
-                living_expenses_df, 
-                employment_projections_df, 
-                university_text
-            )
-        
-        # Initialize memory and chains
-        if 'memory' not in st.session_state:
-            st.session_state.memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True
-            )
-        
-        # Create tools and initialize agent with custom prompt
-        tools = create_tools()
-        agent = initialize_agent(
-            tools=tools,
-            llm=llm,
-            agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
-            memory=st.session_state.memory,
-            verbose=True
-        )
-        
-        # Create retrieval chain with custom prompt
-        retrieval_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=vector_store.as_retriever(search_kwargs={"k": 5}),
-            memory=st.session_state.memory,
-            verbose=True,
-            return_source_documents=True
-        )
-        
-        # Display appropriate interface based on state
-        if not st.session_state.show_chat:
-            if 'initial_recommendations' in st.session_state and st.session_state.initial_recommendations:
-                # Show recommendations if they exist
-                st.write("### Your Current Recommendations")
-                st.write(st.session_state.initial_recommendations)
-                if st.button("Update Preferences"):
-                    if display_preferences_form():
-                        save_current_session()
-                        st.experimental_rerun()
+    """Main application function."""
+    # Page configuration
+    st.set_page_config(
+        page_title="COMPASS - University Recommendation System",
+        page_icon="🎓",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Initialize session state
+    initialize_session_state()
+    
+    # Initialize ChromaDB if not already initialized
+    if not st.session_state.initialized:
+        with st.spinner("Initializing system..."):
+            if initialize_chromadb():
+                st.session_state.initialized = True
             else:
-                # Show preferences form for new users or updates
-                if display_preferences_form():
-                    save_current_session()
-                    st.experimental_rerun()
-        else:
-            # Show chat interface
-            display_chat_interface(agent, retrieval_chain)
-            save_current_session()
+                st.error("Failed to initialize the system. Please refresh the page.")
+                return
+    
+    # Display appropriate page based on authentication state
+    if not st.session_state.authenticated:
+        show_login_page()
+    else:
+        # Show sidebar
+        show_sidebar()
         
-        # Add footer with helpful information
-        st.markdown("---")
-        with st.expander("ℹ️ Tips for using the Assistant"):
-            st.write("""
-            - Ask specific questions about recommended universities
-            - Inquire about admission requirements, deadlines, and application processes
-            - Ask about scholarships and financial aid opportunities
-            - Get information about campus life and student services
-            - Learn about housing options and living costs
-            - Explore career opportunities and job placement rates
-            """)
-            
-    except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
-        if 'user_id' in st.session_state:
-            save_current_session()
+        # Show preferences page if preferences not set
+        if not st.session_state.user_data.get("preferences"):
+            show_preferences_form()
+        else:
+            show_chat_interface()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        st.error(f"Application Error: {str(e)}")
-        st.write("Please refresh the page and try again.")
+    main()
